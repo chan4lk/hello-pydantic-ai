@@ -130,7 +130,7 @@ class PitchDeckAnalyzer:
             print(f"Error extracting {field_name}: {e}")
             return None
 
-    def analyze_pitch_deck(self, file_path: str) -> BusinessTermSheet:
+    def analyze_pitch_deck(self, file_path: str) -> Dict[str, Optional[str]]:
         try:
             # Initialize vector store
             print(f"\nAnalyzing pitch deck: {file_path}")
@@ -144,7 +144,7 @@ class PitchDeckAnalyzer:
                 extracted_data[field_name] = self.query_field(field_name, description)
             
             # Create and return BusinessTermSheet instance
-            return BusinessTermSheet(**extracted_data)
+            return extracted_data
             
         except Exception as e:
             print(f"Error analyzing pitch deck: {e}")
@@ -158,7 +158,7 @@ def main():
     try:
         results = analyzer.analyze_pitch_deck(file_path)
         print("\nExtracted Business Terms:")
-        print(json.dumps(results.model_dump(), indent=2))
+        print(json.dumps(results, indent=2))
     except Exception as e:
         print(f"Error analyzing pitch deck: {e}")
 
