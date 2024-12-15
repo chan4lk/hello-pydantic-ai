@@ -9,9 +9,16 @@ import os
 from business_term_sheet import BusinessTermSheet
 from dotenv import load_dotenv
 import json
+from dataclasses import dataclass
 
 # Load environment variables
 load_dotenv()
+
+@dataclass
+class FieldResult:
+    output_value: str
+    is_mentioned: bool
+    confidence: int
 
 class PitchDeckAnalyzer:
     def __init__(self):
@@ -83,21 +90,30 @@ class PitchDeckAnalyzer:
             print(f"Error creating vector store: {e}")
             raise
 
-    def query_field(self, field_name: str, description: str) -> str:
+    def query_field(self, field_name: str, description: str) -> FieldResult:
         try:
             if not self.vector_store:
                 raise ValueError("Vector store not initialized. Please call create_vector_store first.")
 
             # Query the vector store for relevant chunks
             query = f"Find information about {field_name}: {description}"
-            docs = self.vector_store.similarity_search(query, k=3)
+            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
             
-            if not docs:
+            if not docs_with_scores:
                 print(f"No relevant content found for {field_name}")
-                return "Not mentioned"
+                return FieldResult(
+                    output_value="Not mentioned",
+                    is_mentioned=False,
+                    confidence=0
+                )
+
+            # Calculate average similarity score
+            avg_similarity = sum(score for _, score in docs_with_scores) / len(docs_with_scores)
+            # Convert similarity score to confidence percentage (0-100)
+            confidence = int(min(100, max(0, (1 - avg_similarity) * 100)))
 
             # Combine the relevant chunks into context
-            context = "\n".join([doc.page_content for doc in docs])
+            context = "\n".join([doc.page_content for doc, _ in docs_with_scores])
             
             # Prepare the prompt for GPT
             prompt = f"""Based on the following context from a pitch deck, extract the {field_name}. 
@@ -123,14 +139,23 @@ class PitchDeckAnalyzer:
             )
             
             extracted_value = response.choices[0].message.content.strip()
-            print(f"Extracted {field_name}: {extracted_value}")
-            return extracted_value if extracted_value != "Not mentioned" else None
+            print(f"Extracted {field_name}: {extracted_value} (Confidence: {confidence}%)")
+            
+            return FieldResult(
+                output_value=extracted_value,
+                is_mentioned=extracted_value != "Not mentioned",
+                confidence=confidence
+            )
 
         except Exception as e:
             print(f"Error extracting {field_name}: {e}")
-            return None
+            return FieldResult(
+                output_value="Error during extraction",
+                is_mentioned=False,
+                confidence=0
+            )
 
-    def analyze_pitch_deck(self, file_path: str) -> Dict[str, Optional[str]]:
+    def analyze_pitch_deck(self, file_path: str) -> Dict[str, Dict[str, any]]:
         try:
             # Initialize vector store
             print(f"\nAnalyzing pitch deck: {file_path}")
@@ -141,9 +166,13 @@ class PitchDeckAnalyzer:
             for field_name, field_info in BusinessTermSheet.model_fields.items():
                 description = field_info.description or field_name
                 print(f"\nExtracting {field_name}...")
-                extracted_data[field_name] = self.query_field(field_name, description)
+                result = self.query_field(field_name, description)
+                extracted_data[field_name] = {
+                    "output_value": result.output_value,
+                    "is_mentioned": result.is_mentioned,
+                    "confidence": result.confidence
+                }
             
-            # Create and return BusinessTermSheet instance
             return extracted_data
             
         except Exception as e:
@@ -152,9 +181,8 @@ class PitchDeckAnalyzer:
 
 def main():
     analyzer = PitchDeckAnalyzer()
-    
-    # Example usage
     file_path = "/Users/chandima/repos/resume-analysis/term-sheets/data/pitch/BISTEC Care Deck Short version.pdf"
+    
     try:
         results = analyzer.analyze_pitch_deck(file_path)
         print("\nExtracted Business Terms:")
