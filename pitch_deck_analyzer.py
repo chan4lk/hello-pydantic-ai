@@ -1,24 +1,45 @@
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, TypedDict, Annotated, Sequence, TypeVar, Union
 import PyPDF2
 from pptx import Presentation
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.docstore.document import Document
+from langchain_community.chat_models import ChatOpenAI
+from langchain_core.messages import HumanMessage, SystemMessage
+from duckduckgo_search import DDGS
 import os
 from business_term_sheet import BusinessTermSheet
 from dotenv import load_dotenv
 import json
 from dataclasses import dataclass
+import time
+from requests.exceptions import RequestException
 
 # Load environment variables
 load_dotenv()
 
-@dataclass
 class FieldResult:
-    output_value: str
-    is_mentioned: bool
-    confidence: int
+    def __init__(self, output_value: str, is_mentioned: bool, confidence: int, source: str):
+        self.output_value = output_value
+        self.is_mentioned = is_mentioned
+        self.confidence = confidence
+        self.source = source
+
+    def to_dict(self):
+        return {
+            "output_value": self.output_value,
+            "is_mentioned": self.is_mentioned,
+            "confidence": self.confidence,
+            "source": self.source
+        }
+
+class GraphState(TypedDict):
+    field_name: str
+    description: str
+    context: str
+    result: Optional[FieldResult]
+    next_step: str
 
 class PitchDeckAnalyzer:
     def __init__(self):
@@ -29,6 +50,34 @@ class PitchDeckAnalyzer:
             length_function=len,
         )
         self.vector_store = None
+        self.llm = ChatOpenAI(model="gpt-4", temperature=0)
+        self.search = None  # Initialize DDGS for each search to avoid rate limits
+        self.last_search_time = 0
+        self.min_search_interval = 2  # Minimum seconds between searches
+
+    def _safe_web_search(self, query: str, max_retries: int = 3) -> List[Dict]:
+        """Perform web search with rate limiting and retries."""
+        current_time = time.time()
+        time_since_last_search = current_time - self.last_search_time
+        
+        if time_since_last_search < self.min_search_interval:
+            time.sleep(self.min_search_interval - time_since_last_search)
+        
+        for attempt in range(max_retries):
+            try:
+                # Create a new DDGS instance for each search
+                self.search = DDGS()
+                results = list(self.search.text(query, max_results=2))
+                self.last_search_time = time.time()
+                return results
+            except Exception as e:
+                if "Ratelimit" in str(e) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5  # Exponential backoff
+                    print(f"Rate limited, waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                raise e
+        return []
 
     def extract_text_from_pdf(self, file_path: str) -> List[Document]:
         documents = []
@@ -90,88 +139,131 @@ class PitchDeckAnalyzer:
             print(f"Error creating vector store: {e}")
             raise
 
+    def _calculate_confidence(self, similarity_scores: List[float] = None, source: str = "llm") -> int:
+        """Calculate confidence score based on source and similarity scores."""
+        if similarity_scores:
+            # For vector store, use average similarity score
+            avg_similarity = sum(similarity_scores) / len(similarity_scores)
+            base_confidence = int(min(100, max(0, (1 - avg_similarity) * 100)))
+        else:
+            # Base confidence for different sources
+            base_confidence = {
+                "vector_store": 70,
+                "web_search": 50,
+                "llm": 30
+            }.get(source, 0)
+        
+        # Apply source-specific modifiers
+        if source == "web_search":
+            # Reduce confidence for web search relative to vector store
+            base_confidence = int(base_confidence * 0.8)
+        elif source == "llm":
+            # Further reduce confidence for LLM-only responses
+            base_confidence = int(base_confidence * 0.6)
+        
+        return min(100, max(0, base_confidence))
+
     def query_field(self, field_name: str, description: str) -> FieldResult:
+        """Query a single field using sequential fallback strategy."""
         try:
-            if not self.vector_store:
-                raise ValueError("Vector store not initialized. Please call create_vector_store first.")
+            # Try vector store first
+            if self.vector_store:
+                query = f"Find information about {field_name}: {description}"
+                docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
+                
+                if docs_with_scores:
+                    similarity_scores = [score for _, score in docs_with_scores]
+                    confidence = self._calculate_confidence(similarity_scores, "vector_store")
+                    
+                    if confidence >= 30:
+                        context = "\n".join([doc.page_content for doc, _ in docs_with_scores])
+                        result = self._extract_with_llm(field_name, description, context)
+                        if result.is_mentioned:
+                            result.confidence = confidence
+                            result.source = "vector_store"
+                            return result
 
-            # Query the vector store for relevant chunks
-            query = f"Find information about {field_name}: {description}"
-            docs_with_scores = self.vector_store.similarity_search_with_score(query, k=3)
-            
-            if not docs_with_scores:
-                print(f"No relevant content found for {field_name}")
-                return FieldResult(
-                    output_value="Not mentioned",
-                    is_mentioned=False,
-                    confidence=0
-                )
+            # Try web search if vector store fails
+            try:
+                # Use a shorter query for web search
+                search_query = f"{field_name} {description.split('.')[0]}"  # Only use the first sentence
+                search_results = self._safe_web_search(search_query)
+                
+                if search_results:
+                    context = "\n".join([f"{result['title']}: {result['body']}" for result in search_results])
+                    result = self._extract_with_llm(field_name, description, context)
+                    if result.is_mentioned:
+                        result.confidence = self._calculate_confidence(source="web_search")
+                        result.source = "web_search"
+                        return result
+            except Exception as e:
+                print(f"Web search failed: {e}")
 
-            # Calculate average similarity score
-            avg_similarity = sum(score for _, score in docs_with_scores) / len(docs_with_scores)
-            # Convert similarity score to confidence percentage (0-100)
-            confidence = int(min(100, max(0, (1 - avg_similarity) * 100)))
+            # Fallback to LLM generation
+            prompt = f"""Generate a response for the following field from a pitch deck:
+            Field: {field_name}
+            Description: {description}
+            
+            If you cannot provide accurate information, respond with 'Not mentioned'.
+            """
 
-            # Combine the relevant chunks into context
-            context = "\n".join([doc.page_content for doc, _ in docs_with_scores])
-            
-            # Prepare the prompt for GPT
-            prompt = f"""Based on the following context from a pitch deck, extract the {field_name}. 
-            The field description is: {description}
-            If the information is not explicitly mentioned, respond with 'Not mentioned'.
-            
-            Context:
-            {context}
-            
-            {field_name}:"""
-
-            from openai import OpenAI
-            client = OpenAI()
-            
-            response = client.chat.completions.create(
-                model="gpt-4",
-                messages=[
-                    {"role": "system", "content": "You are a precise business analyst. Extract specific information from pitch deck content. If information is not explicitly mentioned, respond with 'Not mentioned'."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0,
-                max_tokens=150
-            )
-            
-            extracted_value = response.choices[0].message.content.strip()
-            print(f"Extracted {field_name}: {extracted_value} (Confidence: {confidence}%)")
+            response = self.llm.invoke([
+                SystemMessage(content="You are a precise business analyst. Generate information only if you are confident."),
+                HumanMessage(content=prompt)
+            ])
             
             return FieldResult(
-                output_value=extracted_value,
-                is_mentioned=extracted_value != "Not mentioned",
-                confidence=confidence
+                output_value=response.content.strip(),
+                is_mentioned=response.content.strip() != "Not mentioned",
+                confidence=self._calculate_confidence(source="llm"),
+                source="llm_generation"
             )
 
         except Exception as e:
-            print(f"Error extracting {field_name}: {e}")
+            print(f"Error querying field {field_name}: {e}")
             return FieldResult(
                 output_value="Error during extraction",
                 is_mentioned=False,
-                confidence=0
+                confidence=self._calculate_confidence(),  # Default to 0
+                source="error"
             )
 
+    def _extract_with_llm(self, field_name: str, description: str, context: str) -> FieldResult:
+        """Helper method to extract information using LLM from context."""
+        prompt = f"""Based on the following context, extract the {field_name}. 
+        The field description is: {description}
+        If the information is not explicitly mentioned, respond with 'Not mentioned'.
+        
+        Context:
+        {context}
+        
+        {field_name}:"""
+
+        response = self.llm.invoke([
+            SystemMessage(content="You are a precise business analyst. Extract specific information from the given context."),
+            HumanMessage(content=prompt)
+        ])
+        
+        extracted_value = response.content.strip()
+        return FieldResult(
+            output_value=extracted_value,
+            is_mentioned=extracted_value != "Not mentioned",
+            confidence=0,  # Will be set by the caller
+            source=""  # Will be set by the caller
+        )
+
     def analyze_pitch_deck(self, file_path: str) -> Dict[str, Dict[str, any]]:
+        """Analyze the entire pitch deck."""
         try:
-            # Initialize vector store
             print(f"\nAnalyzing pitch deck: {file_path}")
             self.create_vector_store(file_path)
             
-            # Extract each field using RAG
             extracted_data = {}
             for field_name, field_info in BusinessTermSheet.model_fields.items():
                 description = field_info.description or field_name
                 print(f"\nExtracting {field_name}...")
                 result = self.query_field(field_name, description)
-                extracted_data[field_name] = {
-                    "output_value": result.output_value,
-                    "is_mentioned": result.is_mentioned,
-                    "confidence": result.confidence
-                }
+                extracted_data[field_name] = result.to_dict()
             
             return extracted_data
             
